@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -57,6 +58,10 @@ def get_group_chats() -> List[Dict[str, Any]]:
     - room_name: The room identifier (used in cache_roomnames)
     - display_name: Human-readable name (may be None)
     - chat_identifier: Alternative identifier
+    - service_name: The service (iMessage, SMS, etc.)
+    - applescript_id: Full ID for AppleScript (e.g., "any;+;chat123...")
+
+    On error, returns a list with a single dict containing an "error" key.
     """
     global _GROUP_CHATS_CACHE, _GROUP_CHATS_CACHE_TIME
 
@@ -66,30 +71,49 @@ def get_group_chats() -> List[Dict[str, Any]]:
 
     try:
         db_path = get_messages_db_path()
+
+        # Check if the database file exists
+        if not os.path.exists(db_path):
+            return [{"error": f"Messages database not found at {db_path}. PLEASE TELL THE USER TO GRANT FULL DISK ACCESS TO THE TERMINAL APPLICATION AND RESTART."}]
+
         with sqlite3.connect(db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
             # Query for group chats (those with room_name set)
+            # Include service_name for reference (actual chat ID uses "any" prefix)
             cursor.execute("""
                 SELECT
                     ROWID as rowid,
                     room_name,
                     display_name,
-                    chat_identifier
+                    chat_identifier,
+                    service_name
                 FROM chat
                 WHERE room_name IS NOT NULL AND room_name != ''
                 ORDER BY display_name, room_name
             """)
 
-            results = [dict(row) for row in cursor.fetchall()]
+            results = []
+            for row in cursor.fetchall():
+                chat = dict(row)
+                # Construct the AppleScript-compatible chat ID
+                # Format: any;+;{chat_identifier}
+                # Messages app uses "any" for service, "+" for group chats, "-" for 1:1
+                chat_id = chat.get('chat_identifier') or chat.get('room_name')
+                chat['applescript_id'] = f"any;+;{chat_id}"
+                results.append(chat)
 
         _GROUP_CHATS_CACHE = results
         _GROUP_CHATS_CACHE_TIME = current_time
         return results
+    except sqlite3.OperationalError as e:
+        error_msg = str(e)
+        if "unable to open database" in error_msg.lower() or "permission denied" in error_msg.lower():
+            return [{"error": f"Cannot access Messages database. Please grant Full Disk Access permission. Error: {error_msg}"}]
+        return [{"error": f"Database error: {error_msg}"}]
     except Exception as e:
-        print(f"Error getting group chats: {str(e)}")
-        return []
+        return [{"error": f"Error getting group chats: {str(e)}"}]
 
 
 def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
@@ -104,17 +128,29 @@ def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
         name: The group chat name to search for
 
     Returns:
-        List of matching group chats with scores
+        List of matching group chats with:
+        - name: Display name
+        - room_name: Room identifier
+        - chat_id: Database ROWID
+        - applescript_id: Full ID for AppleScript (e.g., "any;+;chat123...")
+        - score: Match confidence
     """
     chats = get_group_chats()
 
-    # First, try exact match on room_name or chat_identifier (for ID lookups)
+    # Check for errors from get_group_chats
+    if chats and len(chats) == 1 and "error" in chats[0]:
+        return []  # Return empty list on error, caller should check get_group_chats directly for errors
+
+    # First, try exact match on room_name, chat_identifier, or applescript_id (for ID lookups)
     for chat in chats:
-        if chat.get('room_name') == name or chat.get('chat_identifier') == name:
+        if (chat.get('room_name') == name or
+            chat.get('chat_identifier') == name or
+            chat.get('applescript_id') == name):
             return [{
                 "name": chat.get('display_name') or chat.get('room_name') or chat.get('chat_identifier'),
                 "room_name": chat.get('room_name'),
                 "chat_id": chat.get('rowid'),
+                "applescript_id": chat.get('applescript_id'),
                 "score": 1.0
             }]
 
@@ -128,27 +164,30 @@ def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
         # Add display_name as primary searchable (if exists)
         if display_name:
             candidates.append((display_name, chat))
-        # Add chat_identifier as fallback (for unnamed chats)
+        # Add room_name or chat_identifier as fallback (for unnamed chats)
+        elif room_name:
+            candidates.append((room_name, chat))
         elif chat_identifier:
             candidates.append((chat_identifier, chat))
 
     # Perform fuzzy matching
     matches = fuzzy_match(name, candidates)
 
-    # Deduplicate by room_name, keeping highest score
-    seen_rooms = {}
+    # Deduplicate by applescript_id (unique per service+chat), keeping highest score
+    seen_chats = {}
     for matched_name, chat, score in matches:
-        room_name = chat.get('room_name')
-        if room_name not in seen_rooms or score > seen_rooms[room_name]["score"]:
-            seen_rooms[room_name] = {
+        applescript_id = chat.get('applescript_id')
+        if applescript_id not in seen_chats or score > seen_chats[applescript_id]["score"]:
+            seen_chats[applescript_id] = {
                 "name": chat.get('display_name') or chat.get('room_name') or chat.get('chat_identifier'),
-                "room_name": room_name,
+                "room_name": chat.get('room_name'),
                 "chat_id": chat.get('rowid'),
+                "applescript_id": applescript_id,
                 "score": score
             }
 
     # Convert to sorted list
-    results = sorted(seen_rooms.values(), key=lambda x: x["score"], reverse=True)
+    results = sorted(seen_chats.values(), key=lambda x: x["score"], reverse=True)
     return results
 
 
@@ -582,102 +621,214 @@ def find_contact_by_name(name: str) -> List[Dict[str, Any]]:
     results = sorted(seen_phones.values(), key=lambda x: x["score"], reverse=True)
     return results
 
-def send_message(recipient: str, message: str, group_chat: bool = False) -> str:
+def send_message(recipient: str, message: str, group_chat: Optional[bool] = None) -> str:
     """
-    Send a message using the Messages app with improved contact resolution.
-    
+    Send a message using the Messages app with improved contact and group chat resolution.
+
     Args:
-        recipient: Phone number, email, contact name, or special format for contact selection
+        recipient: Phone number, email, contact name, group chat name, or selector
                   Use "contact:N" to select the Nth contact from a previous ambiguous match
+                  Use "group:N" to select the Nth group chat from a previous ambiguous match
         message: Message text to send
-        group_chat: Whether this is a group chat (uses chat ID instead of buddy)
-    
+        group_chat: Optional override for message type:
+                   None (default) = auto-detect based on recipient resolution
+                   True = force group chat mode (only search group chats)
+                   False = force contact mode (only search contacts)
+
     Returns:
         Success or error message
     """
     # Convert to string to ensure phone numbers work properly
     recipient = str(recipient).strip()
-    
+
+    # Handle group chat selection format (group:N)
+    if recipient.lower().startswith("group:"):
+        # Reject if force mode conflicts with selector type
+        if group_chat is False:
+            return "Error: Cannot use 'group:N' selector when group_chat=False (contact-only mode)."
+        try:
+            group_parts = recipient.split(":", 1)
+            if len(group_parts) < 2 or not group_parts[1].strip():
+                return "Error: Invalid group selection format. Use 'group:N' where N is a positive number."
+
+            try:
+                index = int(group_parts[1].strip()) - 1
+            except ValueError:
+                return "Error: Group selection must be a number. Use 'group:N' where N is a positive number."
+
+            if index < 0:
+                return "Error: Group selection must be a positive number (starting from 1)."
+
+            if not hasattr(send_message, "recent_group_matches") or not send_message.recent_group_matches:
+                return "No recent group chat matches available. Please search for a group chat first."
+
+            if index >= len(send_message.recent_group_matches):
+                return f"Invalid selection. Please choose a number between 1 and {len(send_message.recent_group_matches)}."
+
+            # Get the selected group chat and clear cache after use
+            group = send_message.recent_group_matches[index]
+            result = _send_message_to_recipient(group['applescript_id'], message, group['name'], group_chat=True)
+            # Clear caches after successful send to prevent stale matches
+            if not result.startswith("Error"):
+                send_message.recent_group_matches = []
+                send_message.recent_matches = []
+            return result
+        except Exception as e:
+            return f"Error selecting group chat: {str(e)}"
+
     # Handle contact selection format (contact:N)
     if recipient.lower().startswith("contact:"):
+        # Reject if force mode conflicts with selector type
+        if group_chat is True:
+            return "Error: Cannot use 'contact:N' selector when group_chat=True (group-only mode)."
         try:
-            # Get the selected index (1-based)
-            index = int(recipient.split(":", 1)[1].strip()) - 1
-            
-            # Get the most recent contact matches from global cache
+            contact_parts = recipient.split(":", 1)
+            if len(contact_parts) < 2 or not contact_parts[1].strip():
+                return "Error: Invalid contact selection format. Use 'contact:N' where N is a positive number."
+
+            try:
+                index = int(contact_parts[1].strip()) - 1
+            except ValueError:
+                return "Error: Contact selection must be a number. Use 'contact:N' where N is a positive number."
+
+            if index < 0:
+                return "Error: Contact selection must be a positive number (starting from 1)."
+
             if not hasattr(send_message, "recent_matches") or not send_message.recent_matches:
                 return "No recent contact matches available. Please search for a contact first."
-            
-            if index < 0 or index >= len(send_message.recent_matches):
+
+            if index >= len(send_message.recent_matches):
                 return f"Invalid selection. Please choose a number between 1 and {len(send_message.recent_matches)}."
-            
-            # Get the selected contact
+
+            # Get the selected contact and clear cache after use
             contact = send_message.recent_matches[index]
-            return _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat)
-        except (ValueError, IndexError) as e:
+            result = _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat=False)
+            # Clear caches after successful send to prevent stale matches
+            if not result.startswith("Error"):
+                send_message.recent_group_matches = []
+                send_message.recent_matches = []
+            return result
+        except Exception as e:
             return f"Error selecting contact: {str(e)}"
-    
+
+    # Handle email addresses directly (before name matching)
+    if '@' in recipient and '.' in recipient:
+        if group_chat is True:
+            return "Error: Cannot send to a group chat using an email address. Use a group chat name instead."
+        return _send_message_to_recipient(recipient, message, group_chat=False)
+
     # Check if recipient is directly a phone number
     if all(c.isdigit() or c in '+- ()' for c in recipient):
+        if group_chat is True:
+            return "Error: Cannot send to a group chat using a phone number. Use a group chat name instead."
         # Clean the phone number
         clean_number = ''.join(c for c in recipient if c.isdigit())
-        return _send_message_to_recipient(clean_number, message, group_chat=group_chat)
-    
-    # Try to find the contact by name
-    contacts = find_contact_by_name(recipient)
-    
-    if not contacts:
-        return f"Error: Could not find any contact matching '{recipient}'"
-    
-    if len(contacts) == 1:
-        # Single match, use it
-        contact = contacts[0]
-        return _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat)
+        return _send_message_to_recipient(clean_number, message, group_chat=False)
+
+    # For name-based lookups, search both groups and contacts (unless forced)
+    # Check for group chat DB access errors only if forcing group-only mode
+    if group_chat is True:
+        chats = get_group_chats()
+        if chats and len(chats) == 1 and "error" in chats[0]:
+            return f"Error accessing group chats: {chats[0]['error']}"
+
+    group_matches = [] if group_chat is False else find_group_chat_by_name(recipient)
+    contact_matches = [] if group_chat is True else find_contact_by_name(recipient)
+
+    # Determine what we found
+    has_groups = len(group_matches) > 0
+    has_contacts = len(contact_matches) > 0
+
+    if not has_groups and not has_contacts:
+        return f"Error: Could not find any contact or group chat matching '{recipient}'"
+
+    # Single group match only
+    if has_groups and not has_contacts and len(group_matches) == 1:
+        group = group_matches[0]
+        send_message.recent_group_matches = []
+        send_message.recent_matches = []
+        return _send_message_to_recipient(group['applescript_id'], message, group['name'], group_chat=True)
+
+    # Single contact match only
+    if has_contacts and not has_groups and len(contact_matches) == 1:
+        contact = contact_matches[0]
+        send_message.recent_group_matches = []
+        send_message.recent_matches = []
+        return _send_message_to_recipient(contact['phone'], message, contact['name'], group_chat=False)
+
+    # Multiple matches - need disambiguation
+    send_message.recent_group_matches = group_matches
+    send_message.recent_matches = contact_matches
+
+    if has_groups and has_contacts:
+        # Both group chats and contacts match
+        result_lines = [f"Found matches for '{recipient}' in both group chats and contacts:\n"]
+        result_lines.append("Group chats:")
+        for i, g in enumerate(group_matches[:5]):
+            result_lines.append(f"  {i+1}. {g['name']} (use 'group:{i+1}')")
+        result_lines.append("\nContacts:")
+        for i, c in enumerate(contact_matches[:5]):
+            result_lines.append(f"  {i+1}. {c['name']} ({c['phone']}) (use 'contact:{i+1}')")
+        return "\n".join(result_lines)
+    elif has_groups:
+        # Only group chat matches
+        group_list = "\n".join([f"{i+1}. {g['name']}" for i, g in enumerate(group_matches[:10])])
+        return f"Multiple group chats found matching '{recipient}'. Please specify which one using 'group:N' where N is the number:\n{group_list}"
     else:
-        # Store the matches for later selection
-        send_message.recent_matches = contacts
-        
-        # Multiple matches, return them all
-        contact_list = "\n".join([f"{i+1}. {c['name']} ({c['phone']})" for i, c in enumerate(contacts[:10])])
+        # Only contact matches
+        contact_list = "\n".join([f"{i+1}. {c['name']} ({c['phone']})" for i, c in enumerate(contact_matches[:10])])
         return f"Multiple contacts found matching '{recipient}'. Please specify which one using 'contact:N' where N is the number:\n{contact_list}"
 
-# Initialize the static variable for recent matches
+
+# Initialize the static variables for recent matches
 send_message.recent_matches = []
+send_message.recent_group_matches = []
 
 def _send_message_to_recipient(recipient: str, message: str, contact_name: str = None, group_chat: bool = False) -> str:
     """
     Internal function to send a message to a specific recipient using file-based approach.
-    
+
     Args:
-        recipient: Phone number or email
+        recipient: Phone number, email, or AppleScript chat ID for group chats
+                   For group chats, use format: "any;+;{chat_identifier}"
         message: Message text to send
         contact_name: Optional contact name for the success message
         group_chat: Whether this is a group chat
-    
+
     Returns:
         Success or error message
     """
     try:
-        # Create a temporary file with the message content
-        file_path = os.path.abspath('imessage_tmp.txt')
-        
-        with open(file_path, 'w') as f:
-            f.write(message)
-        
-        # Adjust the AppleScript command based on whether this is a group chat
-        if not group_chat:
-            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{recipient}" of (1st service whose service type = iMessage)'
-        else:
-            command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat "{recipient}"'
-        
-        # Run the AppleScript
-        result = run_applescript(command)
-        
-        # Clean up the temporary file
+        # Create a secure temporary file with the message content
+        # Using tempfile to avoid race conditions and symlink attacks
+        fd, file_path = tempfile.mkstemp(suffix='.txt', prefix='imessage_')
         try:
-            os.remove(file_path)
-        except:
-            pass
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(message)
+            except:
+                # If os.fdopen fails, close the fd manually to prevent leak
+                os.close(fd)
+                raise
+
+            # Escape recipient for AppleScript (handle quotes and backslashes)
+            safe_recipient = recipient.replace('\\', '\\\\').replace('"', '\\"')
+
+            # Adjust the AppleScript command based on whether this is a group chat
+            if not group_chat:
+                command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{safe_recipient}" of (1st service whose service type = iMessage)'
+            else:
+                # For group chats, use chat id with the full format (e.g., "any;+;chat123...")
+                command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat id "{safe_recipient}"'
+
+            # Run the AppleScript
+            result = run_applescript(command)
+        finally:
+            # Clean up the temporary file
+            try:
+                os.remove(file_path)
+            except:
+                pass
         
         # Check result
         if result.startswith("Error:"):
@@ -1323,24 +1474,25 @@ def _send_message_direct(
     Returns:
         Success or error message with service type used
     """
-    # Clean the inputs for AppleScript
-    safe_message = message.replace('"', '\\"').replace('\\', '\\\\')
-    safe_recipient = recipient.replace('"', '\\"')
+    # Clean the inputs for AppleScript (escape backslashes first, then quotes)
+    safe_message = message.replace('\\', '\\\\').replace('"', '\\"')
+    safe_recipient = recipient.replace('\\', '\\\\').replace('"', '\\"')
     
-    # For group chats, stick to iMessage only (SMS doesn't support group chats well)
+    # For group chats, use the full AppleScript chat ID format
+    # The recipient should be in format: "any;+;{chat_identifier}" (e.g., "any;+;chat123...")
     if group_chat:
         script = f'''
         tell application "Messages"
             try
-                -- Try to get the existing chat
-                set targetChat to chat "{safe_recipient}"
-                
+                -- Get the chat using full chat ID format
+                set targetChat to chat id "{safe_recipient}"
+
                 -- Send the message
                 send "{safe_message}" to targetChat
-                
+
                 -- Wait briefly to check for immediate errors
                 delay 1
-                
+
                 -- Return success
                 return "success"
             on error errMsg

@@ -31,6 +31,7 @@ See the [Integration section](#integration) below for setup instructions.
 
 - **Universal Message Sending**: Automatically sends via iMessage or SMS/RCS based on recipient availability
 - **Smart Fallback**: Seamless fallback to SMS when iMessage is unavailable (perfect for Android users)
+- **Group Chat Support**: Send messages to group chats by name with fuzzy matching and auto-detection
 - **Message Reading**: Read recent messages from the macOS Messages app
 - **Contact Filtering**: Filter messages by specific contacts or phone numbers
 - **Fuzzy Search**: Search through message content with intelligent matching
@@ -178,18 +179,43 @@ Mac Messages MCP automatically handles message delivery across different platfor
 
 - **iMessage Users** (iPhone, iPad, Mac): Messages sent via iMessage
 - **Android Users**: Messages automatically fall back to SMS/RCS
-- **Mixed Groups**: Optimal delivery method chosen per recipient
+- **Group Chats**: Sent via iMessage (group chats require iMessage)
 
 ```python
 # Send to iPhone user - uses iMessage
 send_message("+1234567890", "Hey! This goes via iMessage")
 
 # Send to Android user - automatically uses SMS
-send_message("+1987654321", "Hey! This goes via SMS") 
+send_message("+1987654321", "Hey! This goes via SMS")
 
 # Check delivery method before sending
 check_imessage_availability("+1234567890")  # Returns availability status
 ```
+
+### Group Chat Messaging
+
+Send messages to group chats by name with intelligent matching:
+
+```python
+# Send to a group chat by name (auto-detects group vs contact)
+send_message("Family Chat", "Hello everyone!")
+
+# If multiple matches found, use selectors to disambiguate
+send_message("group:1", "This goes to the first matching group")
+
+# Force group-only search (ignore contacts with similar names)
+send_message("Book Club", "Hello!", group_chat=True)
+
+# Find group chats by name (MCP tool: tool_find_group_chat)
+find_group_chat_by_name("Family")  # Returns matching group chats
+
+# List all available group chats (MCP tool: tool_get_chats)
+get_group_chats()  # Returns named group chats
+```
+
+**Disambiguation**: When a name matches both contacts and group chats, you'll be prompted to specify:
+- Use `group:N` to select the Nth group chat match
+- Use `contact:N` to select the Nth contact match
 
 ### As a Module
 

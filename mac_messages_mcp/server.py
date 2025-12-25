@@ -6,6 +6,7 @@ Mac Messages MCP - Entry point fixed for proper MCP protocol implementation
 import asyncio
 import logging
 import sys
+from typing import Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -14,8 +15,10 @@ from mac_messages_mcp.messages import (
     check_addressbook_access,
     check_messages_db_access,
     find_contact_by_name,
+    find_group_chat_by_name,
     fuzzy_search_messages,
     get_cached_contacts,
+    get_group_chats,
     get_recent_messages,
     query_messages_db,
     send_message,
@@ -37,11 +40,14 @@ mcp = FastMCP("MessageBridge")
 def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None) -> str:
     """
     Get recent messages from the Messages app.
-    
+
+    Supports filtering by both contacts and group chats.
+
     Args:
         hours: Number of hours to look back (default: 24)
-        contact: Filter by contact name, phone number, or email (optional)
+        contact: Filter by contact name, phone number, email, or group chat name
                 Use "contact:N" to select a specific contact from previous matches
+                Use "group:N" to select a specific group chat from previous matches
     """
     logger.info(f"Getting recent messages: hours={hours}, contact={contact}")
     try:
@@ -55,15 +61,22 @@ def tool_get_recent_messages(ctx: Context, hours: int = 24, contact: str = None)
         return f"Error getting messages: {str(e)}"
 
 @mcp.tool()
-def tool_send_message(ctx: Context, recipient: str, message: str, group_chat: bool = False) -> str:
+def tool_send_message(ctx: Context, recipient: str, message: str, group_chat: Optional[bool] = None) -> str:
     """
     Send a message using the Messages app.
-    
+
+    Automatically detects whether the recipient is a contact or group chat.
+    Use selectors to disambiguate when multiple matches are found.
+
     Args:
-        recipient: Phone number, email, contact name, or "contact:N" to select from matches
-                  For example, "contact:1" selects the first contact from a previous search
+        recipient: Phone number, email, contact name, group chat name, or selector
+                  Use "contact:N" to select the Nth contact from previous matches
+                  Use "group:N" to select the Nth group chat from previous matches
         message: Message text to send
-        group_chat: Whether to send to a group chat (uses chat ID instead of buddy)
+        group_chat: Optional override (default: auto-detect)
+                   None = auto-detect based on recipient resolution
+                   True = force group chat mode (only search group chats)
+                   False = force contact mode (only search contacts)
     """
     logger.info(f"Sending message to: {recipient}, group_chat: {group_chat}")
     try:
@@ -79,33 +92,87 @@ def tool_send_message(ctx: Context, recipient: str, message: str, group_chat: bo
 def tool_find_contact(ctx: Context, name: str) -> str:
     """
     Find a contact by name using fuzzy matching.
-    
+
+    After finding contacts, you can use 'contact:N' with send_message to send to them.
+
     Args:
         name: The name to search for
     """
     logger.info(f"Finding contact: {name}")
     try:
         matches = find_contact_by_name(name)
-        
+
         if not matches:
             return f"No contacts found matching '{name}'."
-        
+
+        # Store matches for use with send_message's contact:N selector
+        # Also clear stale group matches to avoid confusion
+        send_message.recent_matches = matches
+        send_message.recent_group_matches = []
+
         if len(matches) == 1:
             contact = matches[0]
-            return f"Found contact: {contact['name']} ({contact['phone']}) with confidence {contact['score']:.2f}"
+            return f"Found contact: {contact['name']} ({contact['phone']}) with confidence {contact['score']:.2f}\nUse 'contact:1' with send_message to send to this contact."
         else:
             # Format multiple matches
             result = [f"Found {len(matches)} contacts matching '{name}':"]
             for i, contact in enumerate(matches[:10]):  # Limit to top 10
                 result.append(f"{i+1}. {contact['name']} ({contact['phone']}) - confidence {contact['score']:.2f}")
-            
+
             if len(matches) > 10:
                 result.append(f"...and {len(matches) - 10} more.")
-            
+
+            result.append("\nUse 'contact:N' with send_message to send to a specific contact.")
             return "\n".join(result)
     except Exception as e:
         logger.error(f"Error in find_contact: {str(e)}")
         return f"Error finding contact: {str(e)}"
+
+
+@mcp.tool()
+def tool_find_group_chat(ctx: Context, name: str) -> str:
+    """
+    Find a group chat by name using fuzzy matching.
+
+    After finding group chats, you can use 'group:N' with send_message to send to them.
+
+    Args:
+        name: The group chat name to search for
+    """
+    logger.info(f"Finding group chat: {name}")
+    try:
+        # Check for errors first (e.g., Full Disk Access required)
+        chats = get_group_chats()
+        if chats and len(chats) == 1 and "error" in chats[0]:
+            return f"Error accessing group chats: {chats[0]['error']}"
+
+        matches = find_group_chat_by_name(name)
+
+        if not matches:
+            return f"No group chats found matching '{name}'."
+
+        # Store matches for use with send_message's group:N selector
+        # Also clear stale contact matches to avoid confusion
+        send_message.recent_group_matches = matches
+        send_message.recent_matches = []
+
+        if len(matches) == 1:
+            chat = matches[0]
+            return f"Found group chat: {chat['name']} with confidence {chat['score']:.2f}\nUse 'group:1' with send_message to send to this chat."
+        else:
+            # Format multiple matches
+            result = [f"Found {len(matches)} group chats matching '{name}':"]
+            for i, chat in enumerate(matches[:10]):  # Limit to top 10
+                result.append(f"{i+1}. {chat['name']} - confidence {chat['score']:.2f}")
+
+            if len(matches) > 10:
+                result.append(f"...and {len(matches) - 10} more.")
+
+            result.append("\nUse 'group:N' with send_message to send to a specific chat.")
+            return "\n".join(result)
+    except Exception as e:
+        logger.error(f"Error in find_group_chat: {str(e)}")
+        return f"Error finding group chat: {str(e)}"
 
 @mcp.tool()
 def tool_check_db_access(ctx: Context) -> str:
@@ -158,32 +225,54 @@ def tool_check_addressbook(ctx: Context) -> str:
         return f"Error checking AddressBook: {str(e)}"
 
 @mcp.tool()
-def tool_get_chats(ctx: Context) -> str:
+def tool_get_chats(ctx: Context, name: str = None) -> str:
     """
     List available group chats from the Messages app.
+
+    Args:
+        name: Optional filter to search for group chats by name (fuzzy matching)
     """
-    logger.info("Getting available chats")
+    logger.info(f"Getting available chats, filter: {name}")
     try:
-        query = "SELECT chat_identifier, display_name FROM chat WHERE display_name IS NOT NULL"
-        results = query_messages_db(query)
-        
-        if not results:
-            return "No group chats found."
-        
-        if "error" in results[0]:
-            return f"Error accessing chats: {results[0]['error']}"
-        
-        # Filter out chats without display names and format the results
-        chats = [r for r in results if r.get('display_name')]
-        
-        if not chats:
-            return "No named group chats found."
-        
-        formatted_chats = []
-        for i, chat in enumerate(chats, 1):
-            formatted_chats.append(f"{i}. {chat['display_name']} (ID: {chat['chat_identifier']})")
-        
-        return "Available group chats:\n" + "\n".join(formatted_chats)
+        if name:
+            # Check for DB access errors first
+            chats = get_group_chats()
+            if chats and len(chats) == 1 and "error" in chats[0]:
+                return f"Error accessing group chats: {chats[0]['error']}"
+
+            # Use fuzzy matching if a name filter is provided
+            matches = find_group_chat_by_name(name)
+            if not matches:
+                return f"No group chats found matching '{name}'."
+
+            formatted_chats = []
+            for i, chat in enumerate(matches[:20], 1):
+                formatted_chats.append(
+                    f"{i}. {chat['name']} (confidence: {chat['score']:.2f})"
+                )
+            return f"Group chats matching '{name}':\n" + "\n".join(formatted_chats)
+        else:
+            # List all group chats using cached function
+            chats = get_group_chats()
+
+            if not chats:
+                return "No group chats found."
+
+            # Check for error response
+            if len(chats) == 1 and "error" in chats[0]:
+                return f"Error accessing group chats: {chats[0]['error']}"
+
+            # Filter to only named chats for display
+            named_chats = [c for c in chats if c.get('display_name')]
+
+            if not named_chats:
+                return "No named group chats found."
+
+            formatted_chats = []
+            for i, chat in enumerate(named_chats[:50], 1):
+                formatted_chats.append(f"{i}. {chat['display_name']}")
+
+            return f"Available group chats ({len(named_chats)} total):\n" + "\n".join(formatted_chats)
     except Exception as e:
         logger.error(f"Error getting chats: {str(e)}")
         return f"Error getting chats: {str(e)}"
