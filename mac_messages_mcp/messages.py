@@ -1645,11 +1645,11 @@ def check_messages_db_access() -> str:
 def find_handle_by_phone(phone: str) -> Optional[int]:
     """
     Find a handle ID by phone number, trying various formats.
-    Prioritizes direct message handles over group chat handles.
-    
+    Prioritizes handles with recent messages to avoid stale duplicates.
+
     Args:
         phone: Phone number in any format
-        
+
     Returns:
         handle_id if found, None otherwise
     """
@@ -1657,10 +1657,10 @@ def find_handle_by_phone(phone: str) -> Optional[int]:
     normalized = normalize_phone_number(phone)
     if not normalized:
         return None
-    
+
     # Try various formats for US numbers
     formats_to_try = [normalized]  # Start with the normalized input
-    
+
     # For US numbers, try with and without country code
     if normalized.startswith('1') and len(normalized) > 10:
         # Try without the country code
@@ -1668,27 +1668,28 @@ def find_handle_by_phone(phone: str) -> Optional[int]:
     elif len(normalized) == 10:
         # Try with the country code
         formats_to_try.append('1' + normalized)
-    
-    # Enhanced query that helps distinguish between direct messages and group chats
-    # We'll get all matching handles with additional context
+
+    # Enhanced query that prioritizes handles with recent messages
+    # Apple sometimes creates duplicate handles for the same phone number,
+    # and the one with recent messages is the active one
     placeholders = ', '.join(['?' for _ in formats_to_try])
     query = f"""
-    SELECT 
+    SELECT
         h.ROWID,
         h.id,
-        COUNT(DISTINCT chj.chat_id) as chat_count,
-        MIN(chj.chat_id) as min_chat_id,
-        GROUP_CONCAT(DISTINCT c.display_name) as chat_names
+        COUNT(DISTINCT m.ROWID) as msg_count,
+        MAX(m.date) as latest_msg
     FROM handle h
-    LEFT JOIN chat_handle_join chj ON h.ROWID = chj.handle_id
-    LEFT JOIN chat c ON chj.chat_id = c.ROWID
+    LEFT JOIN message m ON h.ROWID = m.handle_id
     WHERE h.id IN ({placeholders}) OR h.id IN ({placeholders})
     GROUP BY h.ROWID, h.id
-    ORDER BY 
-        -- Prioritize handles with fewer chats (likely direct messages)
-        chat_count ASC,
-        -- Then by smallest ROWID (older/more established handles)
-        h.ROWID ASC
+    ORDER BY
+        -- Prioritize handles with the most recent messages (active handles)
+        latest_msg DESC NULLS LAST,
+        -- Then by message count (more messages = more established)
+        msg_count DESC,
+        -- Finally by ROWID as tiebreaker
+        h.ROWID DESC
     """
     
     # Create parameters list with both the raw formats and with "+" prefix
