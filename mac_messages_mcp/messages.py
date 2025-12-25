@@ -59,7 +59,7 @@ def get_group_chats() -> List[Dict[str, Any]]:
     - display_name: Human-readable name (may be None)
     - chat_identifier: Alternative identifier
     - service_name: The service (iMessage, SMS, etc.)
-    - applescript_id: Full ID for AppleScript (e.g., "any;+;chat123...")
+    - applescript_id: Full ID for AppleScript (e.g., "iMessage;+;chat123...")
 
     On error, returns a list with a single dict containing an "error" key.
     """
@@ -81,7 +81,7 @@ def get_group_chats() -> List[Dict[str, Any]]:
             cursor = conn.cursor()
 
             # Query for group chats (those with room_name set)
-            # Include service_name for reference (actual chat ID uses "any" prefix)
+            # Include service_name for constructing AppleScript chat ID
             cursor.execute("""
                 SELECT
                     ROWID as rowid,
@@ -97,11 +97,15 @@ def get_group_chats() -> List[Dict[str, Any]]:
             results = []
             for row in cursor.fetchall():
                 chat = dict(row)
-                # Construct the AppleScript-compatible chat ID
-                # Format: any;+;{chat_identifier}
-                # Messages app uses "any" for service, "+" for group chats, "-" for 1:1
+                # Construct AppleScript-compatible chat IDs
+                # Different macOS versions use different formats:
+                # - Some use: {service_name};+;{chat_identifier} (e.g., "iMessage;+;chat123...")
+                # - Others use: any;+;{chat_identifier} (e.g., "any;+;chat123...")
+                # We store both and try them in sequence when sending
+                service = chat.get('service_name') or 'iMessage'
                 chat_id = chat.get('chat_identifier') or chat.get('room_name')
-                chat['applescript_id'] = f"any;+;{chat_id}"
+                chat['applescript_id'] = f"{service};+;{chat_id}"
+                chat['applescript_id_alt'] = f"any;+;{chat_id}"
                 results.append(chat)
 
         _GROUP_CHATS_CACHE = results
@@ -132,7 +136,7 @@ def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
         - name: Display name
         - room_name: Room identifier
         - chat_id: Database ROWID
-        - applescript_id: Full ID for AppleScript (e.g., "any;+;chat123...")
+        - applescript_id: Full ID for AppleScript (e.g., "iMessage;+;chat123...")
         - score: Match confidence
     """
     chats = get_group_chats()
@@ -151,6 +155,7 @@ def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
                 "room_name": chat.get('room_name'),
                 "chat_id": chat.get('rowid'),
                 "applescript_id": chat.get('applescript_id'),
+                "applescript_id_alt": chat.get('applescript_id_alt'),
                 "score": 1.0
             }]
 
@@ -183,6 +188,7 @@ def find_group_chat_by_name(name: str) -> List[Dict[str, Any]]:
                 "room_name": chat.get('room_name'),
                 "chat_id": chat.get('rowid'),
                 "applescript_id": applescript_id,
+                "applescript_id_alt": chat.get('applescript_id_alt'),
                 "score": score
             }
 
@@ -667,7 +673,10 @@ def send_message(recipient: str, message: str, group_chat: Optional[bool] = None
 
             # Get the selected group chat and clear cache after use
             group = send_message.recent_group_matches[index]
+            # Try primary ID format first, then alt format (macOS version differences)
             result = _send_message_to_recipient(group['applescript_id'], message, group['name'], group_chat=True)
+            if result.startswith("Error") and group.get('applescript_id_alt'):
+                result = _send_message_to_recipient(group['applescript_id_alt'], message, group['name'], group_chat=True)
             # Clear caches after successful send to prevent stale matches
             if not result.startswith("Error"):
                 send_message.recent_group_matches = []
@@ -747,7 +756,11 @@ def send_message(recipient: str, message: str, group_chat: Optional[bool] = None
         group = group_matches[0]
         send_message.recent_group_matches = []
         send_message.recent_matches = []
-        return _send_message_to_recipient(group['applescript_id'], message, group['name'], group_chat=True)
+        # Try primary ID format first, then alt format (macOS version differences)
+        result = _send_message_to_recipient(group['applescript_id'], message, group['name'], group_chat=True)
+        if result.startswith("Error") and group.get('applescript_id_alt'):
+            result = _send_message_to_recipient(group['applescript_id_alt'], message, group['name'], group_chat=True)
+        return result
 
     # Single contact match only
     if has_contacts and not has_groups and len(contact_matches) == 1:
@@ -790,7 +803,7 @@ def _send_message_to_recipient(recipient: str, message: str, contact_name: str =
 
     Args:
         recipient: Phone number, email, or AppleScript chat ID for group chats
-                   For group chats, use format: "any;+;{chat_identifier}"
+                   For group chats, use format: "{service};+;{chat_identifier}"
         message: Message text to send
         contact_name: Optional contact name for the success message
         group_chat: Whether this is a group chat
@@ -818,7 +831,7 @@ def _send_message_to_recipient(recipient: str, message: str, contact_name: str =
             if not group_chat:
                 command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to participant "{safe_recipient}" of (1st service whose service type = iMessage)'
             else:
-                # For group chats, use chat id with the full format (e.g., "any;+;chat123...")
+                # For group chats, use chat id with the full format (e.g., "iMessage;+;chat123...")
                 command = f'tell application "Messages" to send (read (POSIX file "{file_path}") as «class utf8») to chat id "{safe_recipient}"'
 
             # Run the AppleScript
@@ -1479,7 +1492,7 @@ def _send_message_direct(
     safe_recipient = recipient.replace('\\', '\\\\').replace('"', '\\"')
     
     # For group chats, use the full AppleScript chat ID format
-    # The recipient should be in format: "any;+;{chat_identifier}" (e.g., "any;+;chat123...")
+    # The recipient should be in format: "{service};+;{chat_identifier}" (e.g., "iMessage;+;chat123...")
     if group_chat:
         script = f'''
         tell application "Messages"
